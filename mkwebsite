@@ -1,0 +1,123 @@
+#!/bin/bash
+
+# Check if dump has been passed
+if [ ! -z $1 ] && [ -r $1 ]
+then
+    echo "Brewing has been started...";
+    dump_file=$1;
+else
+    echo "File $1 does not exist or read permissions is not granted";
+    exit 1;
+fi
+
+# Get variables from user
+read -p 'Website name: ' website_name;
+database_name=$website_name;
+#read -p 'Database name: ' database_name;
+read -sp 'Mysql Password: ' mysql_password;
+
+# Create database
+mysql -u root -p$mysql_password -e "create database $database_name";
+
+# Import sql dump
+mysql -u root -p$mysql_password $database_name < $dump_file;
+
+# Install yii2 application
+composer create-project --prefer-dist yiisoft/yii2-app-advanced $website_name;
+
+# Move to the app directory
+cd ./$website_name
+
+# Install migration tool
+composer require bizley/migration:~2.3.0
+
+# Initiate app environment
+./init --env=Development --overwrite=n;
+
+# Configure database settings
+echo "<?php
+return [
+    'components' => [
+        'db' => [
+            'class' => 'yii\db\Connection',
+            'dsn' => 'mysql:host=127.0.0.1;dbname=$database_name',
+            'username' => 'root',
+            'password' => '$mysql_password',
+            'charset' => 'utf8',
+        ],
+        'mailer' => [
+            'class' => 'yii\swiftmailer\Mailer',
+            'viewPath' => '@common/mail',
+            // send all mails to a file by default. You have to set
+            // 'useFileTransport' to false and configure a transport
+            // for the mailer to send real emails.
+            'useFileTransport' => true,
+        ],
+    ],
+];" > ./common/config/main-local.php;
+
+# Configure migration tool settings
+echo "<?php
+return [
+    'bootstrap' => ['gii'],
+    'modules' => [
+        'gii' => 'yii\gii\Module',
+    ],
+    'controllerMap' => [
+        'migration' => [
+            'class' => 'bizley\migration\controllers\MigrationController',
+        ],
+    ],
+];" > ./console/config/main-local.php
+
+# Generate migrations from database
+./yii migration/create-all <<-EOF
+y
+EOF
+
+# Reset database
+mysql -u root -p$mysql_password -e "drop database $database_name";
+mysql -u root -p$mysql_password -e "create database $database_name";
+
+# Apply migrations
+./yii migrate <<-EOF
+yes
+EOF
+
+# Generate models and backend crud
+TABLES=($(mysql -u root -p$mysql_password -D $database_name -sNe "show tables;"));
+
+for i in "${TABLES[@]}"
+do 
+    class=$(echo $i | gsed -r 's/(^|_)([a-z])/\U\2/g');
+
+    controller=Controller;
+    controllerNamespace=backend\\controllers\\;
+    controllerName=$(echo $class | cut -c 2-);
+    controllerClass=$controllerNamespace$controllerName$controller;
+    
+    modelNamespace=common\\models\\;
+    modelClass=$modelNamespace$class;
+    
+    searchModel=Search;
+    searchModelClass=$modelNamespace$class$searchModel;
+
+    docRoot=$(pwd);
+    viewPath=/backend/views/
+    viewDir=${i//_/-};
+    viewDir=$(echo $viewDir | cut -c 3-);
+    viewPath=$docRoot$viewPath$viewDir;
+
+    if [ $class != 'User' ] && [ $class != 'Migration' ]
+    then
+        ./yii gii/model --tableName="$i" --modelClass="$class" --ns="common\models" <<-EOF
+yes
+EOF
+        ./yii gii/crud --controllerClass="$controllerClass" --viewPath="$viewPath" --modelClass="$modelClass" --searchModelClass="$searchModelClass" <<-EOF
+yes
+EOF
+
+    fi
+done
+
+
